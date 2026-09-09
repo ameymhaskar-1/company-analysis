@@ -1,12 +1,32 @@
 import yfinance as yf
 import pandas as pd
-import datetime
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+class TimeoutSession(requests.Session):
+    """Custom requests session that enforces strict timeouts globally."""
+    def request(self, *args, **kwargs):
+        kwargs.setdefault('timeout', (5, 15)) # 5s connect, 15s read
+        return super().request(*args, **kwargs)
 
 class YFinanceProvider:
     def __init__(self, ticker_str):
         self.ticker_str = ticker_str
-        self.ticker = yf.Ticker(ticker_str)
         self.source_name = "Yahoo Finance API"
+        
+        # Build robust session
+        self.session = TimeoutSession()
+        retry = Retry(total=3, backoff_factor=1, status_forcelist=[429, 500, 502, 503, 504])
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session.mount('http://', adapter)
+        self.session.mount('https://', adapter)
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        })
+        
+        # Inject the timeout session into yfinance
+        self.ticker = yf.Ticker(ticker_str, session=self.session)
         
     def fetch_market_data(self):
         try:
@@ -21,32 +41,24 @@ class YFinanceProvider:
                 'Dividend Yield': info.get('dividendYield', pd.NA),
                 'Beta': info.get('beta', pd.NA),
             }
-        except Exception:
+        except Exception as e:
+            print(f"[{self.ticker_str}] YFinance Market Data Error: {e}")
             return {}
 
     def fetch_financials(self, max_years):
-        """Fetches real reported financials, handling missing data without inventing numbers."""
         try:
             inc_stmt = self.ticker.financials
             bs = self.ticker.balance_sheet
             cf = self.ticker.cashflow
             
             data = []
-            
-            # Helper to extract value
             def _get_val(df, metric, dt):
-                try:
-                    return df.loc[metric, dt]
-                except KeyError:
-                    return pd.NA
+                try: return df.loc[metric, dt]
+                except KeyError: return pd.NA
 
-            # Determine available years
             available_dates = list(inc_stmt.columns)[:max_years] if not inc_stmt.empty else []
-            
             for dt in available_dates:
                 fy = f"FY{dt.year}"
-                
-                # Real Income Statement mapping
                 metrics = {
                     'Revenue': ('Total Revenue', inc_stmt),
                     'EBITDA': ('EBITDA', inc_stmt),
@@ -61,14 +73,11 @@ class YFinanceProvider:
                     val = _get_val(df_src, m_key, dt)
                     if pd.notna(val):
                         data.append({
-                            'Financial Year': fy,
-                            'Period End': dt.strftime('%Y-%m-%d'),
-                            'Metric': m_name,
-                            'Value': val,
-                            'Unit': 'INR',
-                            'Source': self.source_name,
-                            'Reported/Calculated': 'Reported'
+                            'Financial Year': fy, 'Period End': dt.strftime('%Y-%m-%d'),
+                            'Metric': m_name, 'Value': val, 'Unit': 'INR',
+                            'Source': self.source_name, 'Reported/Calculated': 'Reported'
                         })
             return pd.DataFrame(data)
-        except Exception:
+        except Exception as e:
+            print(f"[{self.ticker_str}] YFinance Financials Error: {e}")
             return pd.DataFrame()
